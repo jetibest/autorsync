@@ -1,0 +1,189 @@
+#!/bin/sh
+
+inotifywait_cmd=(
+	"/bin/inotifywait"
+	"--recursive"
+	"--event" "attrib,close_write,moved_from,moved_to,create,delete"
+)
+rsync_cmd=("/bin/rsync")
+ssh_cmd=("/bin/ssh")
+ssh_host="127.0.0.1"
+
+print_help()
+{
+	echo "Usage: autorsync sync-directory -e 'ssh -p 2222' user@example.com:/path/to/remote/master/dir/ /path/to/local/slave/dir/"
+}
+
+# rsync shortcut command:
+sync_directory=false
+if [ "$1" == "sync-directory" ]
+then
+	# preserve filesystem synchronization (without checksum for speed)
+	# note that r is explicitly added in order to support recursion in --files-from
+	rsync_cmd+=("-arAX" "--del")
+	sync_directory=true
+	shift
+fi
+
+# default ssh command and host
+# passthrough for rsync arguments
+rsync_args=("$@")
+rsync_args_count="${#rsync_args[@]}"
+
+if [ "$rsync_args_count" -lt 2 ]
+then
+	echo "error: Invalid usage (not enough arguments)."
+	print_help
+	exit 1
+fi
+
+# grab remote and local directories
+rsync_remote="${rsync_args[$((rsync_args_count - 2))]}"
+rsync_local="${rsync_args[$((rsync_args_count - 1))]}"
+
+if ! [ -d "$rsync_local" ]
+then
+	echo "error: Invalid usage ($rsync_local is not a local directory)."
+	print_help
+	exit 1
+fi
+
+# force trailing slash (if directory sync), important for rsync:
+if $sync_directory
+then
+	rsync_remote="${rsync_remote%%/}/"
+	rsync_local="${rsync_local%%/}/"
+fi
+
+# remove last two arguments (source and target paths)
+unset rsync_args[$((rsync_args_count - 2))]
+unset rsync_args[$((rsync_args_count - 1))]
+
+# parse remote details from rsync args:
+master_dir="${rsync_remote#*:}"
+ssh_host="${rsync_remote%%:*}"
+
+# extract slave directory from rsync args:
+slave_dir="$rsync_local"
+
+# detect bad usage
+if [ "${master_dir:0:1}" != "/" ] || [ "${ssh_host:0:1}" == "/" ]
+then
+	echo "error: Invalid usage ($rsync_remote is not a remote directory)."
+	print_help
+	exit 1
+fi
+
+# create control file for ssh
+ssh_control="$(mktemp)"
+
+# extract custom ssh command from rsync args
+# and append controlpath option to ssh
+found=false
+for index in "${!rsync_args[@]}"
+do
+	arg="${rsync_args[index]}"
+	
+	if $found
+	then
+		ssh_cmd=($arg)
+		rsync_args[index]="$arg -o ControlPath=\"$ssh_control\""
+		break
+	
+	elif [ "$arg" == "-e" ]
+	then
+		found=true
+	fi
+done
+if ! $found
+then
+	rsync_cmd+=("-e" "${ssh_cmd[*]} -o ControlPath=\"$ssh_control\"")
+fi
+
+
+
+ssh_open()
+{
+	# temp file was reserved, but delete since we need to use it now:
+	rm -f "$ssh_control"
+	
+	"${ssh_cmd[@]}" -nNf -o ControlMaster=yes -o ControlPath="$ssh_control" "$ssh_host"
+}
+ssh_exec()
+{
+	"${ssh_cmd[@]}" -o ControlPath="$ssh_control" "$ssh_host" "$(printf '%q ' "$@")"
+}
+ssh_rsync()
+{
+	# prevent rsync from catching interrupt signal, gracefully finish the transfer
+	(
+		set -m
+		trap -- '' SIGINT
+		"${rsync_cmd[@]}" "${rsync_args[@]}" "$@" &
+		wait
+	)
+}
+ssh_close()
+{
+	"${ssh_cmd[@]}" -O exit -o ControlPath="$ssh_control" "$ssh_host"
+	
+	rm -f "$ssh_control" # explicit clean up
+}
+
+cleanup()
+{
+	ssh_close
+	rm -f "$files_tmp"
+	exec 3>&- # close fd
+}
+trap -- 'cleanup' EXIT
+
+graceful_exit()
+{
+	mark_exit=true
+}
+trap -- 'graceful_exit' SIGINT
+
+
+ssh_open || exit $?
+
+exec 3< <(ssh_exec "${inotifywait_cmd[@]}" --format '%e %w%f' --monitor "$master_dir")
+
+mark_exit=false
+path_offset="${#master_dir}"
+files_tmp="$(mktemp)"
+while ! $mark_exit && read -r -u 3 events_csv file
+do
+	file="${file:$path_offset}"
+	case ",$events_csv," in
+		(*,MOVED_FROM,*|*,DELETE,*)
+			# sync parent directory, since this file/directory does not exist anymore
+			file="./${file%%/}" # ensure there is a parent directory, and remove any trailing slash
+			file="${file%/*}" # remove the last file or directory entry in path
+		;;
+	esac
+	echo "$file" > "$files_tmp"
+	
+	# check for more files/events in buffer:
+	while read -u 3 -t 0
+	do
+		if read -r -u 3 events_csv file
+		then
+			file="${file:$path_offset}"
+			case ",$events_csv," in
+				(*,MOVED_FROM,*|*,DELETE,*)
+					# sync parent directory, since this file/directory does not exist anymore
+					file="./${file%%/}" # ensure there is a parent directory
+					file="${file%/*}" # remove the last file or directory entry in path
+				;;
+			esac
+			echo "$file" >> "$files_tmp"
+		fi
+	done
+	
+	# synchronize with rsync
+	echo -n "Synchronizing... " >&2
+	ssh_rsync --files-from="$files_tmp" "$ssh_host:$master_dir" "$slave_dir" && echo " [DONE]" >&2 || echo " [FAILED]" >&2
+done
+
+
